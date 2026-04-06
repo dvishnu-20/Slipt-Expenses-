@@ -127,14 +127,6 @@ function auth(req, res, next) {
   }
 }
 
-async function ensureGroupMembership(userId, groupId) {
-  const row = await get(
-    "SELECT id FROM group_members WHERE group_id = $1 AND user_id = $2",
-    [groupId, userId]
-  );
-  return !!row;
-}
-
 function round2(num) {
   return Math.round((num + Number.EPSILON) * 100) / 100;
 }
@@ -247,10 +239,11 @@ async function computeGroupBalances(groupId) {
   return { members, balanceMap, settlements, riskByUser };
 }
 
-// Routes
-app.get("/api/health", (_, res) => res.json({ ok: true }));
+const router = express.Router();
 
-app.post("/api/auth/register", async (req, res) => {
+router.get("/health", (_, res) => res.json({ ok: true }));
+
+router.post("/auth/register", async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ error: "Missing fields" });
@@ -267,7 +260,7 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+router.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await get("SELECT * FROM users WHERE email = $1", [String(email || "").toLowerCase()]);
@@ -281,7 +274,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-app.get("/api/groups/my", auth, async (req, res) => {
+router.get("/groups/my", auth, async (req, res) => {
   const groups = await all(
     `SELECT g.id, g.name, g.invite_code, g.reminder_frequency FROM groups_table g
      JOIN group_members gm ON gm.group_id = g.id WHERE gm.user_id = $1`,
@@ -290,7 +283,7 @@ app.get("/api/groups/my", auth, async (req, res) => {
   res.json({ groups });
 });
 
-app.get("/api/groups/:groupId/dashboard", auth, async (req, res) => {
+router.get("/groups/:groupId/dashboard", auth, async (req, res) => {
   const groupId = Number(req.params.groupId);
   if (!(await ensureGroupMembership(req.user.userId, groupId))) return res.status(403).json({ error: "Deny" });
   const group = await get("SELECT * FROM groups_table WHERE id = $1", [groupId]);
@@ -309,7 +302,7 @@ app.get("/api/groups/:groupId/dashboard", auth, async (req, res) => {
   res.json({ group, members, expenses, payments, settlements, riskByUser, hasPayments: payments.length > 0 });
 });
 
-app.post("/api/groups/create", auth, async (req, res) => {
+router.post("/groups/create", auth, async (req, res) => {
   try {
     const { name, reminderFrequency } = req.body;
     const inviteCode = makeInviteCode();
@@ -324,7 +317,7 @@ app.post("/api/groups/create", auth, async (req, res) => {
   }
 });
 
-app.post("/api/groups/join", auth, async (req, res) => {
+router.post("/groups/join", auth, async (req, res) => {
   const { inviteCode } = req.body;
   const group = await get("SELECT id, name FROM groups_table WHERE invite_code = $1", [String(inviteCode || "").toUpperCase()]);
   if (!group) return res.status(404).json({ error: "Invalid" });
@@ -332,7 +325,7 @@ app.post("/api/groups/join", auth, async (req, res) => {
   res.json({ groupId: group.id, groupName: group.name });
 });
 
-app.post("/api/expenses", auth, async (req, res) => {
+router.post("/expenses", auth, async (req, res) => {
   const { groupId, title, category, totalAmount, splitType, shares, contributions } = req.body;
   const result = await query(
     "INSERT INTO expenses (group_id, title, category, total_amount, split_type, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
@@ -347,6 +340,19 @@ app.post("/api/expenses", auth, async (req, res) => {
   }
   res.json({ expenseId });
 });
+
+// Mount router on both /api and / to be safe with Vercel rewrites
+app.use("/api", router);
+app.use("/", router);
+
+// Final consolidated DB membership check fix
+async function ensureGroupMembership(userId, groupId) {
+  const row = await get(
+    "SELECT id FROM group_members WHERE group_id = $1 AND user_id = $2",
+    [groupId, userId]
+  );
+  return !!row;
+}
 
 // Export handler
 module.exports = async (req, res) => {
