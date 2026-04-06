@@ -15,25 +15,36 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
 const DATABASE_URL = process.env.DATABASE_URL;
 
+if (!DATABASE_URL && process.env.NODE_ENV === "production") {
+  console.error("CRITICAL: DATABASE_URL is not set in production!");
+}
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+});
+
+pool.on("error", (err) => {
+  console.error("Unexpected error on idle client", err);
 });
 
 async function query(text, params) {
-  return pool.query(text, params);
+  try {
+    return await pool.query(text, params);
+  } catch (err) {
+    console.error("Query Error:", text, err);
+    throw err;
+  }
 }
 
 async function get(text, params) {
-  const { rows } = await pool.query(text, params);
-  return rows[0];
+  const res = await query(text, params);
+  return res.rows[0];
 }
 
 async function all(text, params) {
-  const { rows } = await pool.query(text, params);
-  return rows;
+  const res = await query(text, params);
+  return res.rows;
 }
 
 // DB helpers replaced by query, get, all above.
