@@ -2,7 +2,7 @@
   "name": "room-sync-split",
   "version": "1.0.0",
   "scripts": {
-    "build": "cd frontend && npx vite build && cd .. && mkdir -p public && cp -rv frontend/dist/* public/"
+    "build": "cd frontend && npx vite build"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
