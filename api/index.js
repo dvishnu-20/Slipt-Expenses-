@@ -326,31 +326,305 @@ router.post("/groups/join", auth, async (req, res) => {
 });
 
 router.post("/expenses", auth, async (req, res) => {
-  const { groupId, title, category, totalAmount, splitType, shares, contributions } = req.body;
-  const result = await query(
-    "INSERT INTO expenses (group_id, title, category, total_amount, split_type, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-    [groupId, title, category, totalAmount, splitType, req.user.userId]
-  );
-  const expenseId = result.rows[0].id;
-  const members = await all("SELECT user_id FROM group_members WHERE group_id = $1", [groupId]);
-  for (const m of members) {
-    const s = splitType === "equal" ? round2(totalAmount / members.length) : (shares?.[m.user_id] || 0);
-    const c = splitType === "equal" ? (m.user_id === Number(contributions?.payerUserId) ? totalAmount : 0) : (contributions?.[m.user_id] || 0);
-    await query("INSERT INTO expense_splits (expense_id, user_id, share_amount, contributed_amount) VALUES ($1, $2, $3, $4)", [expenseId, m.user_id, s, c]);
+  try {
+    const { groupId, title, category, totalAmount, splitType, shares, contributions } = req.body;
+    if (!(await ensureGroupMembership(req.user.userId, groupId))) {
+      return res.status(403).json({ error: "Not a member of this group" });
+    }
+    if (!title || !category || !totalAmount || !splitType) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    const members = await all("SELECT user_id FROM group_members WHERE group_id = $1", [groupId]);
+    const memberIds = members.map((m) => m.user_id);
+    const total = round2(Number(totalAmount));
+    if (total <= 0) return res.status(400).json({ error: "Amount must be > 0" });
+
+    const expenseResult = await query(
+      "INSERT INTO expenses (group_id, title, category, total_amount, split_type, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+      [groupId, title, category, total, splitType, req.user.userId]
+    );
+    const expenseId = expenseResult.rows[0].id;
+
+    const safeShares = {};
+    const safeContributions = {};
+
+    if (splitType === "equal") {
+      const each = round2(total / memberIds.length);
+      let running = 0;
+      memberIds.forEach((id, index) => {
+        if (index === memberIds.length - 1) safeShares[id] = round2(total - running);
+        else { safeShares[id] = each; running = round2(running + each); }
+      });
+      memberIds.forEach((id) => {
+        safeContributions[id] = id === Number(contributions?.payerUserId) ? total : 0;
+      });
+    } else {
+      memberIds.forEach((id) => {
+        safeShares[id] = round2(Number(shares?.[id] || 0));
+        safeContributions[id] = round2(Number(contributions?.[id] || 0));
+      });
+      const shareSum = round2(Object.values(safeShares).reduce((a, b) => a + b, 0));
+      const contributionSum = round2(Object.values(safeContributions).reduce((a, b) => a + b, 0));
+      if (shareSum !== total || contributionSum !== total) {
+        return res.status(400).json({ error: `Custom shares and contributions must each sum to total (${total})` });
+      }
+    }
+
+    for (const userId of memberIds) {
+      await query(
+        "INSERT INTO expense_splits (expense_id, user_id, share_amount, contributed_amount) VALUES ($1, $2, $3, $4)",
+        [expenseId, userId, safeShares[userId] || 0, safeContributions[userId] || 0]
+      );
+    }
+    res.json({ expenseId });
+  } catch (error) {
+    res.status(500).json({ error: "Could not add expense" });
   }
-  res.json({ expenseId });
 });
 
-// Mount router on both /api and / to be safe with Vercel rewrites
+router.get("/expenses/:expenseId", auth, async (req, res) => {
+  try {
+    const expenseId = Number(req.params.expenseId);
+    const expense = await get(`SELECT * FROM expenses WHERE id = $1`, [expenseId]);
+    if (!expense) return res.status(404).json({ error: "Expense not found" });
+    if (!(await ensureGroupMembership(req.user.userId, expense.group_id))) {
+      return res.status(403).json({ error: "Not a member of this group" });
+    }
+    if (expense.created_by !== req.user.userId) {
+      return res.status(403).json({ error: "Only the expense creator can edit" });
+    }
+    const splits = await all(`SELECT user_id, share_amount, contributed_amount FROM expense_splits WHERE expense_id = $1`, [expenseId]);
+    res.json({
+      expense: {
+        id: expense.id, groupId: expense.group_id, title: expense.title,
+        category: expense.category, totalAmount: expense.total_amount,
+        splitType: expense.split_type, createdAt: expense.created_at, createdBy: expense.created_by,
+      },
+      splits,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Could not load expense" });
+  }
+});
+
+router.put("/expenses/:expenseId", auth, async (req, res) => {
+  try {
+    const expenseId = Number(req.params.expenseId);
+    const { groupId, title, category, totalAmount, splitType, shares, contributions } = req.body;
+    const expense = await get(`SELECT * FROM expenses WHERE id = $1`, [expenseId]);
+    if (!expense) return res.status(404).json({ error: "Expense not found" });
+    if (!(await ensureGroupMembership(req.user.userId, expense.group_id))) {
+      return res.status(403).json({ error: "Not a member of this group" });
+    }
+    if (expense.created_by !== req.user.userId) {
+      return res.status(403).json({ error: "Only the expense creator can edit" });
+    }
+    if (Number(groupId) !== Number(expense.group_id)) return res.status(400).json({ error: "groupId mismatch" });
+    if (!title || !category || !totalAmount || !splitType) return res.status(400).json({ error: "Missing required fields" });
+
+    const members = await all("SELECT user_id FROM group_members WHERE group_id = $1", [groupId]);
+    const memberIds = members.map((m) => m.user_id);
+    const total = round2(Number(totalAmount));
+    if (total <= 0) return res.status(400).json({ error: "Amount must be > 0" });
+
+    await query(`UPDATE expenses SET title = $1, category = $2, total_amount = $3, split_type = $4 WHERE id = $5`,
+      [title, category, total, splitType, expenseId]);
+    await query(`DELETE FROM expense_splits WHERE expense_id = $1`, [expenseId]);
+
+    const safeShares = {};
+    const safeContributions = {};
+    if (splitType === "equal") {
+      const each = round2(total / memberIds.length);
+      let running = 0;
+      memberIds.forEach((id, index) => {
+        if (index === memberIds.length - 1) safeShares[id] = round2(total - running);
+        else { safeShares[id] = each; running = round2(running + each); }
+      });
+      memberIds.forEach((id) => {
+        safeContributions[id] = id === Number(contributions?.payerUserId) ? total : 0;
+      });
+    } else {
+      memberIds.forEach((id) => {
+        safeShares[id] = round2(Number(shares?.[id] || 0));
+        safeContributions[id] = round2(Number(contributions?.[id] || 0));
+      });
+      const shareSum = round2(Object.values(safeShares).reduce((a, b) => a + b, 0));
+      const contributionSum = round2(Object.values(safeContributions).reduce((a, b) => a + b, 0));
+      if (shareSum !== total || contributionSum !== total) {
+        return res.status(400).json({ error: `Custom shares and contributions must each sum to total (${total})` });
+      }
+    }
+    for (const userId of memberIds) {
+      await query("INSERT INTO expense_splits (expense_id, user_id, share_amount, contributed_amount) VALUES ($1, $2, $3, $4)",
+        [expenseId, userId, safeShares[userId] || 0, safeContributions[userId] || 0]);
+    }
+    await query("DELETE FROM payments WHERE group_id = $1", [groupId]);
+    await query("DELETE FROM reminders WHERE group_id = $1", [groupId]);
+    res.json({ ok: true, expenseId });
+  } catch (error) {
+    res.status(500).json({ error: "Could not update expense" });
+  }
+});
+
+router.delete("/expenses/:expenseId", auth, async (req, res) => {
+  try {
+    const expenseId = Number(req.params.expenseId);
+    const expense = await get(`SELECT * FROM expenses WHERE id = $1`, [expenseId]);
+    if (!expense) return res.status(404).json({ error: "Expense not found" });
+    if (!(await ensureGroupMembership(req.user.userId, expense.group_id))) {
+      return res.status(403).json({ error: "Not a member of this group" });
+    }
+    if (expense.created_by !== req.user.userId) {
+      return res.status(403).json({ error: "Only the expense creator can delete" });
+    }
+    await query(`DELETE FROM expense_splits WHERE expense_id = $1`, [expenseId]);
+    await query(`DELETE FROM expenses WHERE id = $1`, [expenseId]);
+    await query("DELETE FROM payments WHERE group_id = $1", [expense.group_id]);
+    await query("DELETE FROM reminders WHERE group_id = $1", [expense.group_id]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: "Could not delete expense" });
+  }
+});
+
+router.get("/reminders/my", auth, async (req, res) => {
+  try {
+    const reminders = await all(
+      `SELECT r.id, r.group_id, r.amount, r.channel, r.message, r.status, r.created_at,
+              g.name AS group_name, u.name AS from_name
+       FROM reminders r
+       JOIN groups_table g ON g.id = r.group_id
+       JOIN users u ON u.id = r.from_user_id
+       WHERE r.to_user_id = $1 AND r.status = 'pending'
+       ORDER BY r.created_at DESC LIMIT 50`,
+      [req.user.userId]
+    );
+    res.json({ reminders });
+  } catch (error) {
+    res.status(500).json({ error: "Could not fetch reminders" });
+  }
+});
+
+router.post("/reminders/:id/mark-read", auth, async (req, res) => {
+  try {
+    const reminderId = Number(req.params.id);
+    const result = await query(
+      `UPDATE reminders SET status = 'read', read_at = CURRENT_TIMESTAMP WHERE id = $1 AND to_user_id = $2 AND status = 'pending'`,
+      [reminderId, req.user.userId]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "Reminder not found" });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: "Could not mark reminder as read" });
+  }
+});
+
+router.post("/reminders/:id/mark-paid", auth, async (req, res) => {
+  try {
+    const reminderId = Number(req.params.id);
+    const reminder = await get(
+      `SELECT id, group_id, from_user_id, to_user_id, amount, status FROM reminders WHERE id = $1 AND to_user_id = $2`,
+      [reminderId, req.user.userId]
+    );
+    if (!reminder) return res.status(404).json({ error: "Reminder not found" });
+    if (reminder.status !== "pending") return res.status(400).json({ error: "Reminder already processed" });
+    await query(
+      `INSERT INTO payments (group_id, from_user_id, to_user_id, amount, source) VALUES ($1, $2, $3, $4, 'reminder_paid')`,
+      [reminder.group_id, reminder.to_user_id, reminder.from_user_id, reminder.amount]
+    );
+    const result = await query(
+      `UPDATE reminders SET status = 'paid', paid_at = CURRENT_TIMESTAMP WHERE id = $1 AND to_user_id = $2 AND status = 'pending'`,
+      [reminderId, req.user.userId]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "Reminder not found" });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: "Could not mark reminder as paid" });
+  }
+});
+
+router.post("/reminders/send", auth, async (req, res) => {
+  try {
+    const { groupId, channel = "email" } = req.body;
+    if (!(await ensureGroupMembership(req.user.userId, groupId))) {
+      return res.status(403).json({ error: "Not a member of this group" });
+    }
+    const group = await get("SELECT reminder_frequency FROM groups_table WHERE id = $1", [groupId]);
+    const { members, settlements } = await computeGroupBalances(groupId);
+    const byId = Object.fromEntries(members.map((m) => [m.id, m]));
+
+    const reminders = [];
+    for (const s of settlements) {
+      const from = byId[s.fromUserId];
+      const to = byId[s.toUserId];
+      const upiLink = `upi://pay?pa=${encodeURIComponent(to.email)}&pn=${encodeURIComponent(to.name)}&am=${s.amount}&cu=INR`;
+      const msg = `Hi ${from.name}, gentle reminder: please pay INR ${s.amount} to ${to.name}. This is a ${group.reminder_frequency} reminder. UPI: ${upiLink}`;
+      await query(
+        `INSERT INTO reminders (group_id, from_user_id, to_user_id, amount, channel, message) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [groupId, s.toUserId, s.fromUserId, s.amount, channel, msg]
+      );
+      reminders.push({ to: from.email || from.phone, channel, message: msg });
+    }
+    res.json({ sent: reminders.length, reminders, note: "For production, connect to Twilio/SendGrid." });
+  } catch (error) {
+    res.status(500).json({ error: "Could not send reminders" });
+  }
+});
+
+router.get("/groups/:groupId/charts/monthly", auth, async (req, res) => {
+  try {
+    const groupId = Number(req.params.groupId);
+    if (!(await ensureGroupMembership(req.user.userId, groupId))) {
+      return res.status(403).json({ error: "Not a member of this group" });
+    }
+    const limitMonthsRaw = Number(req.query.limitMonths || "6");
+    const limitMonths = Number.isFinite(limitMonthsRaw) && limitMonthsRaw > 0 ? Math.min(limitMonthsRaw, 24) : 6;
+    const start = dayjs().subtract(limitMonths - 1, "month").startOf("month");
+    const months = Array.from({ length: limitMonths }, (_, i) => start.add(i, "month").format("YYYY-MM"));
+    const startDateTime = start.format("YYYY-MM-DD HH:mm:ss");
+
+    const roommates = await all(
+      `SELECT u.id, u.name FROM users u JOIN group_members gm ON gm.user_id = u.id WHERE gm.group_id = $1 ORDER BY u.name ASC`,
+      [groupId]
+    );
+    const spendingRows = await all(
+      `SELECT TO_CHAR(e.created_at, 'YYYY-MM') AS ym, SUM(e.total_amount) AS total
+       FROM expenses e WHERE e.group_id = $1 AND e.created_at >= $2 GROUP BY ym ORDER BY ym`,
+      [groupId, startDateTime]
+    );
+    const spendingByMonth = {};
+    spendingRows.forEach((r) => { spendingByMonth[String(r.ym)] = round2(Number(r.total || 0)); });
+    const monthlySpending = months.map((m) => spendingByMonth[m] || 0);
+
+    const duesRows = await all(
+      `SELECT TO_CHAR(e.created_at, 'YYYY-MM') AS ym, es.user_id,
+              SUM(CASE WHEN (es.share_amount - es.contributed_amount) > 0 THEN (es.share_amount - es.contributed_amount) ELSE 0 END) AS owed
+       FROM expense_splits es JOIN expenses e ON e.id = es.expense_id
+       WHERE e.group_id = $1 AND e.created_at >= $2 GROUP BY ym, es.user_id ORDER BY ym, es.user_id`,
+      [groupId, startDateTime]
+    );
+    const monthlyDuesByUser = {};
+    roommates.forEach((r) => { monthlyDuesByUser[String(r.id)] = months.map(() => 0); });
+    duesRows.forEach((r) => {
+      const uid = String(r.user_id);
+      const monthIndex = months.indexOf(String(r.ym));
+      if (monthIndex < 0) return;
+      if (!monthlyDuesByUser[uid]) monthlyDuesByUser[uid] = months.map(() => 0);
+      monthlyDuesByUser[uid][monthIndex] = round2(Number(r.owed || 0));
+    });
+
+    res.json({ months, monthlySpending, roommates, monthlyDuesByUser });
+  } catch (error) {
+    res.status(500).json({ error: "Could not build monthly charts" });
+  }
+});
+
+// Mount router
 app.use("/api", router);
 app.use("/", router);
 
-// Final consolidated DB membership check fix
 async function ensureGroupMembership(userId, groupId) {
-  const row = await get(
-    "SELECT id FROM group_members WHERE group_id = $1 AND user_id = $2",
-    [groupId, userId]
-  );
+  const row = await get("SELECT id FROM group_members WHERE group_id = $1 AND user_id = $2", [groupId, userId]);
   return !!row;
 }
 
