@@ -3,14 +3,7 @@
   "cleanUrls": true,
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index.js" },
-    { "source": "/(.*)", "destination": "/frontend/dist/$1" }
-  ],
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }
-      ]
-    }
+    { "source": "/(.*)", "destination": "/frontend/dist/$1" },
+    { "source": "/(.*)", "destination": "/frontend/dist/index.html" }
   ]
 }
